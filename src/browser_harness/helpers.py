@@ -500,4 +500,14 @@ def _load_agent_helpers():
         globals()[name] = value
 
 
+def _load_domains():
+    try:
+        from browser_harness.domains import fetch_page_markdown, scrape_slack_channel
+    except ImportError:
+        return
+    globals()["scrape_slack_channel"] = scrape_slack_channel
+    globals()["fetch_page_markdown"] = fetch_page_markdown
+
+
 _load_agent_helpers()
+_load_domains()
