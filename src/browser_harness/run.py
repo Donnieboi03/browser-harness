@@ -44,6 +44,7 @@ Commands:
   browser-harness doctor --fix-snap   print how to fix Snap Chromium blocking CDP (Linux)
   browser-harness --update [-y]    pull the latest version (agents: pass -y)
   browser-harness --reload         stop the daemon so next call picks up code changes
+  browser-harness apply-job --url URL --profile PATH [--submit]
 """
 
 USAGE = """Usage:
@@ -99,6 +100,20 @@ def main():
         restart_daemon()
         print("daemon stopped — will restart fresh on next call")
         return
+    if args and args[0] == "apply-job":
+        from browser_harness.domains.job_apply import run_apply_job_cli
+
+        print_update_banner()
+        if (
+            not daemon_alive()
+            and not _local_chrome_listening()
+            and not _explicit_cdp_configured()
+            and os.environ.get("BROWSER_USE_API_KEY")
+            and os.environ.get("BU_AUTOSPAWN")
+        ):
+            start_remote_daemon(NAME)
+        ensure_daemon()
+        sys.exit(run_apply_job_cli(args[1:]))
     if args and args[0] == "--debug-clicks":
         os.environ["BH_DEBUG_CLICKS"] = "1"
         args = args[1:]

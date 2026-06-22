@@ -1,0 +1,14 @@
+{
+  "first_name": "Ada",
+  "last_name": "Example",
+  "email": "you@example.com",
+  "phone": "+1-555-0100",
+  "linkedin_url": "https://www.linkedin.com/in/your-profile",
+  "github_url": "https://github.com/your-handle",
+  "location": "Springfield, USA",
+  "resume_path": "/absolute/path/to/resume.pdf",
+  "work_authorization": "Authorized to work in the US",
+  "custom_answers": {
+    "sponsorship": "No"
+  }
+}
