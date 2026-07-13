@@ -505,11 +505,13 @@ def _load_domains():
         from browser_harness.domains import (
             apply_to_job,
             fetch_page_markdown,
+            scrape_notifications,
             scrape_slack_channel,
         )
     except ImportError:
         return
     globals()["scrape_slack_channel"] = scrape_slack_channel
+    globals()["scrape_notifications"] = scrape_notifications
     globals()["fetch_page_markdown"] = fetch_page_markdown
     globals()["apply_to_job"] = apply_to_job
 
