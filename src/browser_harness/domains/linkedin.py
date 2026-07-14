@@ -6,10 +6,9 @@ import time
 from typing import Any
 
 from browser_harness.helpers import (
-    close_tab,
-    ensure_real_tab,
+    finish_page,
     js,
-    new_tab,
+    open_page,
     wait_for_load,
 )
 
@@ -145,18 +144,14 @@ def scrape_notifications(
     max_scrolls = max(1, min(int(max_scrolls), 40))
     cutoff_days = float(lookback_days)
 
-    new_tab(url)
+    open_page(url)
     wait_for_load()
     time.sleep(boot_wait_sec)
 
     # Login wall — stop cleanly; caller / human must sign in on scout Chrome.
     href = js("location.href") or ""
     if isinstance(href, str) and ("/login" in href or "/checkpoint" in href or "/uas/" in href):
-        try:
-            close_tab()
-        except Exception:
-            pass
-        ensure_real_tab()
+        finish_page()
         return {
             "markdown": "",
             "items": [],
@@ -215,11 +210,7 @@ def scrape_notifications(
     markdown = "\n\n".join(lines)
     by_id = {str(m["id"]): m for m in kept if m.get("id")}
 
-    try:
-        close_tab()
-    except Exception:
-        pass
-    ensure_real_tab()
+    finish_page()
 
     return {
         "markdown": markdown,

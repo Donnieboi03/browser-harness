@@ -6,10 +6,9 @@ import time
 from typing import Any
 
 from browser_harness.helpers import (
-    close_tab,
-    ensure_real_tab,
+    finish_page,
     js,
-    new_tab,
+    open_page,
     wait_for_load,
 )
 
@@ -100,7 +99,7 @@ def scrape_slack_channel(
     max_passes = lookback_days * scrolls_per_day
     cutoff = time.time() - lookback_days * 86400
 
-    new_tab(url)
+    open_page(url)
     wait_for_load()
     time.sleep(boot_wait_sec)
 
@@ -133,11 +132,7 @@ def scrape_slack_channel(
     lines = [f"[{m.get('ts', '')}] {m.get('text', '')}" for m in messages]
     markdown = "\n\n".join(lines)
 
-    try:
-        close_tab()
-    except Exception:
-        pass
-    ensure_real_tab()
+    finish_page()
 
     return {
         "markdown": markdown,

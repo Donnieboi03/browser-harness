@@ -5,10 +5,9 @@ import time
 from typing import Any
 
 from browser_harness.helpers import (
-    close_tab,
     crawl4ai_from_current_tab,
-    ensure_real_tab,
-    new_tab,
+    finish_page,
+    open_page,
     page_info,
     wait_for_load,
 )
@@ -16,7 +15,7 @@ from browser_harness.helpers import (
 
 def fetch_page_markdown(url: str, *, settle_sec: float = 2.0) -> dict[str, Any]:
     """Open URL, return fit/raw markdown and page metadata."""
-    new_tab(url)
+    open_page(url)
     wait_for_load()
     time.sleep(settle_sec)
     info = page_info()
@@ -27,9 +26,5 @@ def fetch_page_markdown(url: str, *, settle_sec: float = 2.0) -> dict[str, Any]:
         "url": info.get("url") or url,
         "title": info.get("title") or "",
     }
-    try:
-        close_tab()
-    except Exception:
-        pass
-    ensure_real_tab()
+    finish_page()
     return payload

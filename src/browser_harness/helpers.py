@@ -300,7 +300,7 @@ def _mark_tab():
     try: cdp("Runtime.evaluate", expression="if(!document.title.startsWith('\U0001F434'))document.title='\U0001F434 '+document.title")
     except Exception: pass
 
-def switch_tab(target):
+def switch_tab(target, *, activate: bool = True):
     # Accept either a raw targetId string or the dict returned by current_tab() / list_tabs(),
     # so `switch_tab(current_tab())` works without a manual ["targetId"] dance.
     target_id = target.get("targetId") if isinstance(target, dict) else target
@@ -308,11 +308,13 @@ def switch_tab(target):
     # plus the trailing space = 3 code units, so slice(3) cleanly removes the prefix.
     try: cdp("Runtime.evaluate", expression="if(document.title.startsWith('\U0001F434 '))document.title=document.title.slice(3)")
     except Exception: pass
-    cdp("Target.activateTarget", targetId=target_id)
+    if activate:
+        cdp("Target.activateTarget", targetId=target_id)
     sid = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"]
     _send({"meta": "set_session", "session_id": sid, "target_id": target_id})
     _mark_tab()
     return sid
+
 
 def new_tab(url="about:blank"):
     # Always create blank, then goto: passing url to createTarget races with
@@ -323,6 +325,61 @@ def new_tab(url="about:blank"):
     if url != "about:blank":
         goto_url(url)
     return tid
+
+
+def _reuse_tabs_enabled() -> bool:
+    return os.environ.get("BH_REUSE_TAB", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def open_page(url="about:blank"):
+    """Navigate to ``url``.
+
+    When ``BH_REUSE_TAB`` is set (Virgil isolated Chrome jobs), attach to an
+    existing real tab **without** ``Target.activateTarget`` and ``goto_url``.
+    That avoids macOS Space yank on every scrape. Falls back to ``new_tab``.
+    """
+    if _reuse_tabs_enabled():
+        tabs = list_tabs(include_chrome=False)
+        if tabs:
+            # Prefer currently attached target if it is still in the list.
+            prefer = None
+            try:
+                cur = current_tab()
+                cur_id = (cur or {}).get("targetId")
+                if cur_id and any(t.get("targetId") == cur_id for t in tabs):
+                    prefer = cur_id
+            except Exception:
+                prefer = None
+            tid = prefer or tabs[0]["targetId"]
+            switch_tab(tid, activate=False)
+            if url != "about:blank":
+                goto_url(url)
+            return tid
+    return new_tab(url)
+
+
+def finish_page():
+    """End a scrape: blank the reused tab, or close + ensure_real_tab."""
+    if _reuse_tabs_enabled():
+        try:
+            goto_url("about:blank")
+        except Exception:
+            pass
+        return
+    try:
+        close_tab()
+    except Exception:
+        pass
+    try:
+        ensure_real_tab()
+    except Exception:
+        pass
+
 
 def close_tab(target=None):
     """Close a tab. If `target` is omitted, closes the currently attached tab.
