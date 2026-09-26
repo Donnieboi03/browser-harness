@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import time
+import unicodedata
 from typing import Any
 from urllib.parse import quote_plus
 
@@ -21,19 +22,28 @@ _PROFILE_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 
-SEARCH_BEST_MATCH_JS = """(() => {
-  const links = [...document.querySelectorAll('a[href*="/in/"]')]
-    .map(a => (a.href || '').split('?')[0].replace(/\\/$/, ''))
-    .filter(h => /linkedin\\.com\\/in\\//i.test(h));
-  const seen = new Set();
-  const unique = [];
-  for (const h of links) {
-    const key = h.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    unique.push(h);
+SEARCH_CANDIDATES_JS = """(() => {
+  const byUrl = new Map();
+  for (const a of document.querySelectorAll('a[href*="/in/"]')) {
+    const url = (a.href || '').split('?')[0].replace(/\\/$/, '');
+    if (!/linkedin\\.com\\/in\\//i.test(url)) continue;
+    const key = url.toLowerCase();
+    const span = a.querySelector('span[aria-hidden="true"]');
+    const name = ((span ? span.innerText : a.innerText) || '')
+      .split('\\n')[0].trim();
+    const box = a.closest(
+      'li, [data-chameleon-result-urn], [data-view-name*="search-entity"]'
+    ) || a.parentElement;
+    const snippet = ((box && box.innerText) || '')
+      .trim().replace(/\\s+/g, ' ').slice(0, 300);
+    const prev = byUrl.get(key);
+    if (!prev) {
+      byUrl.set(key, { url, name, snippet });
+    } else if (!prev.name && name) {
+      prev.name = name;
+    }
   }
-  return { urls: unique.slice(0, 8), best: unique[0] || '' };
+  return [...byUrl.values()].slice(0, 10);
 })()"""
 
 PROFILE_EXTRACT_JS = """(() => {
@@ -296,6 +306,15 @@ def scrape_notifications(
             age = parse_relative_age_days(str(item.get("ts") or ""))
             if age is not None and age > cutoff_days:
                 continue
+            profiles = [
+                p
+                for p in (
+                    _normalize_profile_url(str(link))
+                    for link in item.get("links") or []
+                )
+                if p
+            ]
+            item["profile_urls"] = list(dict.fromkeys(profiles))
             kept.append(item)
 
         lines = [f"[{m.get('ts', '')}] {m.get('text', '')}" for m in kept]
@@ -369,27 +388,71 @@ def _normalize_profile_url(url: str) -> str | None:
     return m.group(0).rstrip("/")
 
 
+def _tokens(text: str) -> list[str]:
+    folded = unicodedata.normalize("NFKD", text or "")
+    folded = "".join(c for c in folded if not unicodedata.combining(c))
+    return re.findall(r"[a-z0-9]+", folded.lower())
+
+
+def name_matches(query: str, candidate: str) -> bool:
+    """Every token of ``query`` appears in ``candidate`` (order-free)."""
+    want = _tokens(query)
+    have = set(_tokens(candidate))
+    return bool(want) and all(t in have for t in want)
+
+
+def _pick_search_match(
+    query: str, candidates: list[dict[str, Any]], hint: str
+) -> tuple[str | None, str, list[dict[str, Any]]]:
+    """Return (url, stopped_reason, matching candidates).
+
+    Only a single name match (after optional ``hint`` filter) is accepted —
+    common names return ``ambiguous_match`` instead of guessing.
+    """
+    named = [
+        c for c in candidates if name_matches(query, str(c.get("name") or ""))
+    ]
+    if hint:
+        named = [
+            c for c in named if name_matches(hint, str(c.get("snippet") or ""))
+        ]
+    if not named:
+        return None, "no_search_match", []
+    if len(named) > 1:
+        return None, "ambiguous_match", named
+    url = _normalize_profile_url(str(named[0].get("url") or ""))
+    if not url:
+        return None, "no_search_match", []
+    return url, "ok", named
+
+
 def enrich_profile(
     name: str | None = None,
     url: str | None = None,
     *,
+    hint: str | None = None,
     boot_wait_sec: float = 3.0,
     allow_login_resume: bool = False,
 ) -> dict[str, Any]:
-    """Open a LinkedIn profile (by URL or people-search best match) and extract fields.
+    """Open a LinkedIn profile (by URL, or a unique people-search match) and extract fields.
 
     Deterministic, no LLM. Failure modes (``status`` / ``stats.stopped_reason``):
 
     - ``missing_args`` — neither ``name`` nor ``url``
     - ``invalid_url`` — ``url`` given but not a ``/in/`` profile path
     - ``login_required`` / ``awaiting_credentials`` — auth wall
-    - ``no_search_match`` — people search returned no ``/in/`` links
+    - ``no_search_match`` — no search result whose name matches ``name``
+    - ``ambiguous_match`` — several results match; ``stats.candidates`` lists them
+    - ``name_mismatch`` — opened profile's name does not match ``name``
     - ``empty_profile`` — profile opened but name/headline/about all empty
 
-    Best-match search: first unique ``linkedin.com/in/…`` link in DOM order.
+    ``url`` is the reliable path. Name-only search accepts a result only when
+    exactly one candidate's name contains every token of ``name`` (and of
+    ``hint``, e.g. a company, when given).
     """
     profile_url = _normalize_profile_url(url or "")
     query = (name or "").strip()
+    hint_text = (hint or "").strip()
     if not profile_url and not query:
         return {
             "status": "error",
@@ -424,12 +487,15 @@ def enrich_profile(
                     rationale="LinkedIn enrich search hit login wall",
                     allow_login_resume=allow_login_resume,
                 )
-            match = js(SEARCH_BEST_MATCH_JS) or {}
-            if not isinstance(match, dict):
-                match = {}
-            best = str(match.get("best") or "")
-            profile_url = _normalize_profile_url(best)
-            if not profile_url:
+            raw_candidates = js(SEARCH_CANDIDATES_JS) or []
+            if not isinstance(raw_candidates, list):
+                raw_candidates = []
+            candidates = [c for c in raw_candidates if isinstance(c, dict)]
+            picked, reason, matched = _pick_search_match(
+                query, candidates, hint_text
+            )
+            if not picked:
+                shown = matched if reason == "ambiguous_match" else candidates
                 return {
                     "status": "error",
                     "url": href if isinstance(href, str) else search_url,
@@ -438,10 +504,18 @@ def enrich_profile(
                     "about": "",
                     "markdown": "",
                     "stats": {
-                        "stopped_reason": "no_search_match",
-                        "candidates": match.get("urls") or [],
+                        "stopped_reason": reason,
+                        "candidates": [
+                            {
+                                "url": str(c.get("url") or ""),
+                                "name": str(c.get("name") or ""),
+                                "snippet": str(c.get("snippet") or "")[:160],
+                            }
+                            for c in shown[:5]
+                        ],
                     },
                 }
+            profile_url = picked
 
     with tab(profile_url):
         wait_for_load()
@@ -472,6 +546,20 @@ def enrich_profile(
                 "about": "",
                 "markdown": "",
                 "stats": {"stopped_reason": "empty_profile"},
+            }
+        found_name = str(raw.get("name") or "")
+        if query and not name_matches(query, found_name):
+            return {
+                "status": "error",
+                "url": final_url,
+                "name": query,
+                "headline": "",
+                "about": "",
+                "markdown": "",
+                "stats": {
+                    "stopped_reason": "name_mismatch",
+                    "found_name": found_name,
+                },
             }
         lines = [
             f"# {out_name}" if out_name else "# Profile",
