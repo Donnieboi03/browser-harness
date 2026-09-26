@@ -1,18 +1,91 @@
-"""LinkedIn notifications scrape via logged-in Chrome."""
+"""LinkedIn notifications scrape + profile enrich via logged-in Chrome."""
 from __future__ import annotations
 
 import re
 import time
 from typing import Any
+from urllib.parse import quote_plus
 
 from browser_harness.helpers import (
-    finish_page,
     js,
-    open_page,
+    tab,
     wait_for_load,
 )
 
 DEFAULT_NOTIFICATIONS_URL = "https://www.linkedin.com/notifications/"
+SEARCH_PEOPLE_URL = (
+    "https://www.linkedin.com/search/results/people/?keywords={keywords}"
+)
+_PROFILE_PATH_RE = re.compile(
+    r"https?://(?:[\w.-]+\.)?linkedin\.com/in/[\w%-]+/?",
+    re.IGNORECASE,
+)
+
+SEARCH_BEST_MATCH_JS = """(() => {
+  const links = [...document.querySelectorAll('a[href*="/in/"]')]
+    .map(a => (a.href || '').split('?')[0].replace(/\\/$/, ''))
+    .filter(h => /linkedin\\.com\\/in\\//i.test(h));
+  const seen = new Set();
+  const unique = [];
+  for (const h of links) {
+    const key = h.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(h);
+  }
+  return { urls: unique.slice(0, 8), best: unique[0] || '' };
+})()"""
+
+PROFILE_EXTRACT_JS = """(() => {
+  const textOf = (sel) => {
+    const el = document.querySelector(sel);
+    return el ? (el.innerText || '').trim().replace(/\\s+/g, ' ') : '';
+  };
+  const name =
+    textOf('h1') ||
+    textOf('.text-heading-xlarge') ||
+    textOf('[data-anonymize="person-name"]');
+  const headline =
+    textOf('.text-body-medium.break-words') ||
+    textOf('[data-generated-suggestion-target]') ||
+    textOf('.pv-text-details__left-panel .text-body-medium');
+  let about = '';
+  const aboutHeader = [...document.querySelectorAll('h2, section')]
+    .find(el => /\\babout\\b/i.test(el.innerText || ''));
+  if (aboutHeader) {
+    const section = aboutHeader.closest('section') || aboutHeader.parentElement;
+    if (section) {
+      about = (section.innerText || '')
+        .replace(/^about\\s*/i, '')
+        .trim()
+        .replace(/\\s+/g, ' ')
+        .slice(0, 1200);
+    }
+  }
+  const location =
+    textOf('.text-body-small.inline.t-black--light.break-words') ||
+    textOf('span.text-body-small.inline.t-black--light') ||
+    '';
+  let experience = '';
+  const expSection = [...document.querySelectorAll('section')]
+    .find(el => /\\bexperience\\b/i.test(
+      (el.querySelector('h2') || {}).innerText || ''
+    ));
+  if (expSection) {
+    experience = (expSection.innerText || '')
+      .trim()
+      .replace(/\\s+/g, ' ')
+      .slice(0, 800);
+  }
+  return {
+    name,
+    headline,
+    about,
+    location,
+    experience_snip: experience,
+    url: window.location.href || '',
+  };
+})()"""
 
 # Relative age → days (best-effort; LinkedIn shows "2d", "3h", "1w", "Yesterday").
 _REL_RE = re.compile(
@@ -134,6 +207,7 @@ def scrape_notifications(
     max_scrolls: int = 15,
     boot_wait_sec: float = 4.0,
     scroll_pause_sec: float = 0.8,
+    allow_login_resume: bool = False,
 ) -> dict[str, Any]:
     """Open LinkedIn notifications, scroll, return markdown + links.
 
@@ -144,85 +218,280 @@ def scrape_notifications(
     max_scrolls = max(1, min(int(max_scrolls), 40))
     cutoff_days = float(lookback_days)
 
-    open_page(url)
-    wait_for_load()
-    time.sleep(boot_wait_sec)
+    with tab(url):
+        wait_for_load()
+        time.sleep(boot_wait_sec)
 
-    # Login wall — stop cleanly; caller / human must sign in on scout Chrome.
-    href = js("location.href") or ""
-    if isinstance(href, str) and ("/login" in href or "/checkpoint" in href or "/uas/" in href):
-        finish_page()
+        href = js("location.href") or ""
+        if isinstance(href, str) and ("/login" in href or "/checkpoint" in href or "/uas/" in href):
+            if allow_login_resume:
+                return {
+                    "status": "awaiting_credentials",
+                    "markdown": "",
+                    "items": [],
+                    "links": [],
+                    "login": {
+                        "site": "linkedin.com",
+                        "url": href,
+                        "rationale": "LinkedIn notifications scrape hit login wall",
+                        "fields": ["username", "password"],
+                    },
+                    "checkpoint": {"step": "post_nav", "resume_url": url},
+                    "stats": {
+                        "scroll_passes": 0,
+                        "unique_items": 0,
+                        "stopped_reason": "login_required",
+                        "lookback_days": lookback_days,
+                        "max_scrolls": max_scrolls,
+                        "url": href,
+                    },
+                }
+            return {
+                "markdown": "",
+                "items": [],
+                "links": [],
+                "stats": {
+                    "scroll_passes": 0,
+                    "unique_items": 0,
+                    "stopped_reason": "login_required",
+                    "lookback_days": lookback_days,
+                    "max_scrolls": max_scrolls,
+                    "url": href,
+                },
+            }
+
+        seen: dict[str, dict[str, Any]] = {}
+        stopped_reason = "max_scrolls"
+        scroll_passes = 0
+
+        for _ in range(max_scrolls):
+            batch = js(EXTRACT_JS) or []
+            if not isinstance(batch, list):
+                batch = []
+            for item in batch:
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                seen[str(item["id"])] = item
+
+            ages = [
+                parse_relative_age_days(str(m.get("ts") or ""))
+                for m in seen.values()
+            ]
+            ages = [a for a in ages if a is not None]
+            if ages and max(ages) >= cutoff_days and len(seen) >= 3:
+                oldest = max(ages)
+                if oldest >= cutoff_days:
+                    stopped_reason = "lookback_reached"
+                    break
+
+            scroll_result = js(SCROLL_JS) or {}
+            scroll_passes += 1
+            if scroll_result.get("at_bottom"):
+                stopped_reason = "scroll_bottom"
+                break
+            time.sleep(scroll_pause_sec)
+
+        kept: list[dict[str, Any]] = []
+        for item in seen.values():
+            age = parse_relative_age_days(str(item.get("ts") or ""))
+            if age is not None and age > cutoff_days:
+                continue
+            kept.append(item)
+
+        lines = [f"[{m.get('ts', '')}] {m.get('text', '')}" for m in kept]
+        markdown = "\n\n".join(lines)
+        by_id = {str(m["id"]): m for m in kept if m.get("id")}
+
         return {
-            "markdown": "",
-            "items": [],
-            "links": [],
+            "markdown": markdown,
+            "items": kept,
+            "messages": kept,
+            "links": _dedupe_links(by_id),
             "stats": {
-                "scroll_passes": 0,
-                "unique_items": 0,
-                "stopped_reason": "login_required",
+                "scroll_passes": scroll_passes,
+                "unique_items": len(kept),
+                "unique_messages": len(kept),
+                "stopped_reason": stopped_reason,
                 "lookback_days": lookback_days,
                 "max_scrolls": max_scrolls,
-                "url": href,
             },
         }
 
-    seen: dict[str, dict[str, Any]] = {}
-    stopped_reason = "max_scrolls"
-    scroll_passes = 0
 
-    for _ in range(max_scrolls):
-        batch = js(EXTRACT_JS) or []
-        if not isinstance(batch, list):
-            batch = []
-        for item in batch:
-            if not isinstance(item, dict) or not item.get("id"):
-                continue
-            seen[str(item["id"])] = item
+def _is_login_href(href: str) -> bool:
+    return bool(
+        href and ("/login" in href or "/checkpoint" in href or "/uas/" in href)
+    )
 
-        ages = [
-            parse_relative_age_days(str(m.get("ts") or ""))
-            for m in seen.values()
-        ]
-        ages = [a for a in ages if a is not None]
-        if ages and max(ages) >= cutoff_days and len(seen) >= 3:
-            # Enough cards past lookback — stop scrolling further back.
-            oldest = max(ages)
-            if oldest >= cutoff_days:
-                stopped_reason = "lookback_reached"
-                break
 
-        scroll_result = js(SCROLL_JS) or {}
-        scroll_passes += 1
-        if scroll_result.get("at_bottom"):
-            stopped_reason = "scroll_bottom"
-            break
-        time.sleep(scroll_pause_sec)
-
-    # Filter to lookback when age is known; keep unknown-age items.
-    kept: list[dict[str, Any]] = []
-    for item in seen.values():
-        age = parse_relative_age_days(str(item.get("ts") or ""))
-        if age is not None and age > cutoff_days:
-            continue
-        kept.append(item)
-
-    lines = [f"[{m.get('ts', '')}] {m.get('text', '')}" for m in kept]
-    markdown = "\n\n".join(lines)
-    by_id = {str(m["id"]): m for m in kept if m.get("id")}
-
-    finish_page()
-
+def _login_wall_payload(
+    *,
+    href: str,
+    resume_url: str,
+    rationale: str,
+    allow_login_resume: bool,
+) -> dict[str, Any]:
+    if allow_login_resume:
+        return {
+            "status": "awaiting_credentials",
+            "url": href,
+            "name": "",
+            "headline": "",
+            "about": "",
+            "markdown": "",
+            "login": {
+                "site": "linkedin.com",
+                "url": href,
+                "rationale": rationale,
+                "fields": ["username", "password"],
+            },
+            "checkpoint": {"step": "post_nav", "resume_url": resume_url},
+            "stats": {"stopped_reason": "login_required", "url": href},
+        }
     return {
-        "markdown": markdown,
-        "items": kept,
-        "messages": kept,  # alias for slack-shaped consumers
-        "links": _dedupe_links(by_id),
-        "stats": {
-            "scroll_passes": scroll_passes,
-            "unique_items": len(kept),
-            "unique_messages": len(kept),
-            "stopped_reason": stopped_reason,
-            "lookback_days": lookback_days,
-            "max_scrolls": max_scrolls,
-        },
+        "status": "login_required",
+        "url": href,
+        "name": "",
+        "headline": "",
+        "about": "",
+        "markdown": "",
+        "stats": {"stopped_reason": "login_required", "url": href},
     }
+
+
+def _normalize_profile_url(url: str) -> str | None:
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    m = _PROFILE_PATH_RE.search(raw)
+    if not m:
+        return None
+    return m.group(0).rstrip("/")
+
+
+def enrich_profile(
+    name: str | None = None,
+    url: str | None = None,
+    *,
+    boot_wait_sec: float = 3.0,
+    allow_login_resume: bool = False,
+) -> dict[str, Any]:
+    """Open a LinkedIn profile (by URL or people-search best match) and extract fields.
+
+    Deterministic, no LLM. Failure modes (``status`` / ``stats.stopped_reason``):
+
+    - ``missing_args`` — neither ``name`` nor ``url``
+    - ``invalid_url`` — ``url`` given but not a ``/in/`` profile path
+    - ``login_required`` / ``awaiting_credentials`` — auth wall
+    - ``no_search_match`` — people search returned no ``/in/`` links
+    - ``empty_profile`` — profile opened but name/headline/about all empty
+
+    Best-match search: first unique ``linkedin.com/in/…`` link in DOM order.
+    """
+    profile_url = _normalize_profile_url(url or "")
+    query = (name or "").strip()
+    if not profile_url and not query:
+        return {
+            "status": "error",
+            "url": "",
+            "name": "",
+            "headline": "",
+            "about": "",
+            "markdown": "",
+            "stats": {"stopped_reason": "missing_args"},
+        }
+    if url and not profile_url and not query:
+        return {
+            "status": "error",
+            "url": url or "",
+            "name": "",
+            "headline": "",
+            "about": "",
+            "markdown": "",
+            "stats": {"stopped_reason": "invalid_url"},
+        }
+
+    if not profile_url:
+        search_url = SEARCH_PEOPLE_URL.format(keywords=quote_plus(query))
+        with tab(search_url):
+            wait_for_load()
+            time.sleep(boot_wait_sec)
+            href = js("location.href") or ""
+            if isinstance(href, str) and _is_login_href(href):
+                return _login_wall_payload(
+                    href=href,
+                    resume_url=search_url,
+                    rationale="LinkedIn enrich search hit login wall",
+                    allow_login_resume=allow_login_resume,
+                )
+            match = js(SEARCH_BEST_MATCH_JS) or {}
+            if not isinstance(match, dict):
+                match = {}
+            best = str(match.get("best") or "")
+            profile_url = _normalize_profile_url(best)
+            if not profile_url:
+                return {
+                    "status": "error",
+                    "url": href if isinstance(href, str) else search_url,
+                    "name": query,
+                    "headline": "",
+                    "about": "",
+                    "markdown": "",
+                    "stats": {
+                        "stopped_reason": "no_search_match",
+                        "candidates": match.get("urls") or [],
+                    },
+                }
+
+    with tab(profile_url):
+        wait_for_load()
+        time.sleep(boot_wait_sec)
+        href = js("location.href") or ""
+        if isinstance(href, str) and _is_login_href(href):
+            return _login_wall_payload(
+                href=href,
+                resume_url=profile_url,
+                rationale="LinkedIn enrich profile hit login wall",
+                allow_login_resume=allow_login_resume,
+            )
+        raw = js(PROFILE_EXTRACT_JS) or {}
+        if not isinstance(raw, dict):
+            raw = {}
+        out_name = str(raw.get("name") or query or "")
+        headline = str(raw.get("headline") or "")
+        about = str(raw.get("about") or "")
+        location = str(raw.get("location") or "") or None
+        experience = str(raw.get("experience_snip") or "") or None
+        final_url = str(raw.get("url") or href or profile_url)
+        if not out_name and not headline and not about:
+            return {
+                "status": "error",
+                "url": final_url,
+                "name": query,
+                "headline": "",
+                "about": "",
+                "markdown": "",
+                "stats": {"stopped_reason": "empty_profile"},
+            }
+        lines = [
+            f"# {out_name}" if out_name else "# Profile",
+            headline,
+            f"Location: {location}" if location else "",
+            about,
+            f"Experience: {experience}" if experience else "",
+        ]
+        markdown = "\n\n".join(line for line in lines if line)
+        result: dict[str, Any] = {
+            "status": "ok",
+            "url": final_url,
+            "name": out_name,
+            "headline": headline,
+            "about": about,
+            "markdown": markdown,
+            "stats": {"stopped_reason": "ok"},
+        }
+        if location:
+            result["location"] = location
+        if experience:
+            result["experience_snip"] = experience
+        return result

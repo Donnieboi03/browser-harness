@@ -1,14 +1,21 @@
 """Unit tests for browser_harness.domains.linkedin."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from unittest.mock import patch
 
 import pytest
 
 from browser_harness.domains.linkedin import (
+    enrich_profile,
     parse_relative_age_days,
     scrape_notifications,
 )
+
+
+@contextmanager
+def _fake_tab(_url: str = "about:blank"):
+    yield "tid"
 
 
 @pytest.mark.parametrize(
@@ -42,7 +49,7 @@ def test_scrape_notifications_returns_structure() -> None:
         }
     ]
 
-    with patch("browser_harness.domains.linkedin.new_tab"), patch(
+    with patch("browser_harness.domains.linkedin.tab", _fake_tab), patch(
         "browser_harness.domains.linkedin.wait_for_load"
     ), patch("browser_harness.domains.linkedin.time.sleep"), patch(
         "browser_harness.domains.linkedin.js",
@@ -51,8 +58,6 @@ def test_scrape_notifications_returns_structure() -> None:
             fake_batch,
             {"at_bottom": True},
         ],
-    ), patch("browser_harness.domains.linkedin.close_tab"), patch(
-        "browser_harness.domains.linkedin.ensure_real_tab"
     ):
         result = scrape_notifications(lookback_days=3, max_scrolls=5)
 
@@ -63,15 +68,92 @@ def test_scrape_notifications_returns_structure() -> None:
 
 
 def test_scrape_notifications_login_wall() -> None:
-    with patch("browser_harness.domains.linkedin.new_tab"), patch(
+    with patch("browser_harness.domains.linkedin.tab", _fake_tab), patch(
         "browser_harness.domains.linkedin.wait_for_load"
     ), patch("browser_harness.domains.linkedin.time.sleep"), patch(
         "browser_harness.domains.linkedin.js",
         return_value="https://www.linkedin.com/login",
-    ), patch("browser_harness.domains.linkedin.close_tab"), patch(
-        "browser_harness.domains.linkedin.ensure_real_tab"
     ):
         result = scrape_notifications()
 
     assert result["stats"]["stopped_reason"] == "login_required"
     assert result["markdown"] == ""
+
+
+def test_enrich_profile_by_url() -> None:
+    profile = {
+        "name": "Ada Lovelace",
+        "headline": "Mathematician",
+        "about": "First programmer",
+        "location": "London",
+        "experience_snip": "Analytical Engine",
+        "url": "https://www.linkedin.com/in/ada",
+    }
+    with patch("browser_harness.domains.linkedin.tab", _fake_tab), patch(
+        "browser_harness.domains.linkedin.wait_for_load"
+    ), patch("browser_harness.domains.linkedin.time.sleep"), patch(
+        "browser_harness.domains.linkedin.js",
+        side_effect=[
+            "https://www.linkedin.com/in/ada",
+            profile,
+        ],
+    ):
+        result = enrich_profile(url="https://www.linkedin.com/in/ada")
+
+    assert result["status"] == "ok"
+    assert result["name"] == "Ada Lovelace"
+    assert result["headline"] == "Mathematician"
+    assert result["about"] == "First programmer"
+    assert result["location"] == "London"
+    assert "Ada" in result["markdown"]
+
+
+def test_enrich_profile_search_then_open() -> None:
+    with patch("browser_harness.domains.linkedin.tab", _fake_tab), patch(
+        "browser_harness.domains.linkedin.wait_for_load"
+    ), patch("browser_harness.domains.linkedin.time.sleep"), patch(
+        "browser_harness.domains.linkedin.js",
+        side_effect=[
+            "https://www.linkedin.com/search/results/people/?keywords=Ada",
+            {
+                "urls": ["https://www.linkedin.com/in/ada"],
+                "best": "https://www.linkedin.com/in/ada",
+            },
+            "https://www.linkedin.com/in/ada",
+            {
+                "name": "Ada Lovelace",
+                "headline": "Mathematician",
+                "about": "Notes",
+                "location": "",
+                "experience_snip": "",
+                "url": "https://www.linkedin.com/in/ada",
+            },
+        ],
+    ):
+        result = enrich_profile(name="Ada Lovelace")
+
+    assert result["status"] == "ok"
+    assert result["url"].endswith("/in/ada")
+    assert result["name"] == "Ada Lovelace"
+
+
+def test_enrich_profile_login_wall_awaiting() -> None:
+    with patch("browser_harness.domains.linkedin.tab", _fake_tab), patch(
+        "browser_harness.domains.linkedin.wait_for_load"
+    ), patch("browser_harness.domains.linkedin.time.sleep"), patch(
+        "browser_harness.domains.linkedin.js",
+        return_value="https://www.linkedin.com/login",
+    ):
+        result = enrich_profile(
+            url="https://www.linkedin.com/in/ada",
+            allow_login_resume=True,
+        )
+
+    assert result["status"] == "awaiting_credentials"
+    assert result["login"]["site"] == "linkedin.com"
+
+
+def test_enrich_profile_missing_args() -> None:
+    result = enrich_profile()
+    assert result["status"] == "error"
+    assert result["stats"]["stopped_reason"] == "missing_args"
