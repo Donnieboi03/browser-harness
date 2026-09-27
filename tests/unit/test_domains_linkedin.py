@@ -109,6 +109,29 @@ def test_enrich_profile_by_url() -> None:
     assert "Ada" in result["markdown"]
 
 
+def test_enrich_profile_404_is_not_found() -> None:
+    with patch("browser_harness.domains.linkedin.tab", _fake_tab), patch(
+        "browser_harness.domains.linkedin.wait_for_load"
+    ), patch("browser_harness.domains.linkedin.time.sleep"), patch(
+        "browser_harness.domains.linkedin.js",
+        side_effect=[
+            "https://www.linkedin.com/404/",
+            {"name": "", "headline": "", "about": "", "url": "https://www.linkedin.com/404/"},
+        ],
+    ):
+        result = enrich_profile(name="Ada Lovelace", url="https://www.linkedin.com/in/ada")
+
+    assert result["status"] == "error"
+    assert result["stats"]["stopped_reason"] == "not_found"
+
+
+def test_profile_extract_js_has_title_and_h2_fallbacks() -> None:
+    from browser_harness.domains.linkedin import PROFILE_EXTRACT_JS
+
+    assert "document.title" in PROFILE_EXTRACT_JS
+    assert "headlineAfterName" in PROFILE_EXTRACT_JS
+
+
 def test_enrich_profile_search_then_open() -> None:
     with patch("browser_harness.domains.linkedin.tab", _fake_tab), patch(
         "browser_harness.domains.linkedin.wait_for_load"

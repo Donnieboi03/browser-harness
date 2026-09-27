@@ -5,7 +5,7 @@ import re
 import time
 import unicodedata
 from typing import Any
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 from browser_harness.helpers import (
     js,
@@ -51,17 +51,40 @@ PROFILE_EXTRACT_JS = """(() => {
     const el = document.querySelector(sel);
     return el ? (el.innerText || '').trim().replace(/\\s+/g, ' ') : '';
   };
+  const norm = (s) => (s || '').trim().replace(/\\s+/g, ' ');
+  // 2026 layout: hashed class names, name is an <h2>. Title stays "Name | LinkedIn".
+  const titleName = norm((document.title || '').replace(/^\\(\\d+\\+?\\)\\s*/, '').split('|')[0]);
   const name =
     textOf('h1') ||
     textOf('.text-heading-xlarge') ||
-    textOf('[data-anonymize="person-name"]');
+    textOf('[data-anonymize="person-name"]') ||
+    (/\\|\\s*LinkedIn\\s*$/i.test(document.title || '') ? titleName : '');
+  const headlineAfterName = () => {
+    const root = document.querySelector('main') || document.body;
+    const nameEl = [...root.querySelectorAll('h1, h2')].find(e => norm(e.innerText) === name);
+    if (!nameEl) return '';
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+    walker.currentNode = nameEl;
+    for (let i = 0; i < 80 && walker.nextNode(); i++) {
+      const el = walker.currentNode;
+      if (/^H[1-6]$/.test(el.tagName)) break;
+      if (el.tagName !== 'P' || el.children.length > 2) continue;
+      const t = norm(el.innerText);
+      if (t.length < 8 || t === name || /^[\\p{L}]+(\\s*\\/\\s*[\\p{L}]+)+$/u.test(t) || /^·/.test(t)) continue;
+      return t;
+    }
+    return '';
+  };
   const headline =
     textOf('.text-body-medium.break-words') ||
     textOf('[data-generated-suggestion-target]') ||
-    textOf('.pv-text-details__left-panel .text-body-medium');
+    textOf('.pv-text-details__left-panel .text-body-medium') ||
+    (name ? headlineAfterName() : '');
   let about = '';
-  const aboutHeader = [...document.querySelectorAll('h2, section')]
-    .find(el => /\\babout\\b/i.test(el.innerText || ''));
+  const aboutHeader =
+    [...document.querySelectorAll('h2')].find(el => /^about$/i.test(norm(el.innerText))) ||
+    [...document.querySelectorAll('h2, section')]
+      .find(el => /\\babout\\b/i.test(el.innerText || ''));
   if (aboutHeader) {
     const section = aboutHeader.closest('section') || aboutHeader.parentElement;
     if (section) {
@@ -537,6 +560,16 @@ def enrich_profile(
         location = str(raw.get("location") or "") or None
         experience = str(raw.get("experience_snip") or "") or None
         final_url = str(raw.get("url") or href or profile_url)
+        if "/404" in urlparse(final_url).path:
+            return {
+                "status": "error",
+                "url": final_url,
+                "name": query,
+                "headline": "",
+                "about": "",
+                "markdown": "",
+                "stats": {"stopped_reason": "not_found", "requested_url": profile_url},
+            }
         if not out_name and not headline and not about:
             return {
                 "status": "error",
