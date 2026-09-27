@@ -5,7 +5,7 @@ import re
 import time
 import unicodedata
 from typing import Any
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote_plus, unquote, urlparse
 
 from browser_harness.helpers import (
     js,
@@ -149,12 +149,13 @@ EXTRACT_JS = """(() => {
   const skipHost = (h) =>
     /linkedin\\.com\\/(help|legal|uas\\/login|checkpoint)/i.test(h || '');
   const cards = [];
-  const roots = [
+  // 2026 layout: one <article data-view-name="notification-card-container"> per card.
+  const modern = [...document.querySelectorAll('[data-view-name="notification-card-container"]')];
+  const roots = modern.length ? modern : [
     ...document.querySelectorAll(
       '[data-finite-scroll-hotkey-item], ' +
       'div.nt-card, article, ' +
-      'li.notification-card, ' +
-      'div[class*="notification"]'
+      'li.notification-card'
     ),
   ];
   const seen = new Set();
@@ -164,9 +165,17 @@ EXTRACT_JS = """(() => {
     const key = text.slice(0, 160);
     if (seen.has(key)) continue;
     seen.add(key);
-    const links = [...el.querySelectorAll('a[href^="http"]')]
+    // a.href is absolute even when the attribute is a relative "/in/..." path.
+    const anchors = [...el.querySelectorAll('a[href]')];
+    const links = anchors
       .map(a => a.href)
-      .filter(h => h && !skipHost(h) && !h.includes('/notifications'));
+      .filter(h => /^https?:/i.test(h || '') && !skipHost(h) && !h.includes('/notifications'));
+    const people = anchors
+      .filter(a => /\\/in\\//.test(a.href || ''))
+      .map(a => {
+        const m = (a.getAttribute('aria-label') || '').match(/^View (.+?)[\u2019']s profile/i);
+        return {url: a.href, name: m ? m[1].trim() : (a.innerText || '').trim()};
+      });
     // Prefer short relative-time nodes when present
     let ts = '';
     const timeEl = el.querySelector('time, .time-ago, span[class*="time"]');
@@ -180,6 +189,7 @@ EXTRACT_JS = """(() => {
       ts,
       text: text.slice(0, 900),
       links: [...new Set(links)].slice(0, 8),
+      people: people.slice(0, 8),
     });
   }
   return cards;
@@ -338,6 +348,12 @@ def scrape_notifications(
                 if p
             ]
             item["profile_urls"] = list(dict.fromkeys(profiles))
+            people: dict[str, str] = {}
+            for person in item.get("people") or []:
+                purl = _normalize_profile_url(str((person or {}).get("url") or ""))
+                if purl and purl not in people:
+                    people[purl] = str((person or {}).get("name") or "").strip()
+            item["people"] = [{"name": n, "url": u} for u, n in people.items()]
             kept.append(item)
 
         lines = [f"[{m.get('ts', '')}] {m.get('text', '')}" for m in kept]
@@ -408,7 +424,7 @@ def _normalize_profile_url(url: str) -> str | None:
     m = _PROFILE_PATH_RE.search(raw)
     if not m:
         return None
-    return m.group(0).rstrip("/")
+    return unquote(m.group(0)).rstrip("/")
 
 
 def _tokens(text: str) -> list[str]:

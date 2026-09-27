@@ -315,6 +315,40 @@ def test_scrape_notifications_exposes_profile_urls() -> None:
     assert result["items"][0]["profile_urls"] == ["https://www.linkedin.com/in/ada"]
 
 
+def test_scrape_notifications_pairs_names_with_decoded_profile_urls() -> None:
+    batch = [
+        {
+            "id": "Sabrina reacted",
+            "ts": "1d",
+            "text": "Sabrina Burka reacted to your post",
+            "links": ["https://www.linkedin.com/in/sabrina%2Dburka"],
+            "people": [
+                {"url": "https://www.linkedin.com/in/sabrina%2Dburka", "name": "Sabrina Burka"},
+                {"url": "https://www.linkedin.com/in/sabrina-burka/", "name": ""},
+            ],
+        }
+    ]
+    a, b, c, d = _patched_js(
+        ["https://www.linkedin.com/notifications/", batch, {"at_bottom": True}]
+    )
+    with a, b, c, d:
+        result = scrape_notifications(lookback_days=3, max_scrolls=2)
+
+    item = result["items"][0]
+    assert item["profile_urls"] == ["https://www.linkedin.com/in/sabrina-burka"]
+    assert item["people"] == [
+        {"name": "Sabrina Burka", "url": "https://www.linkedin.com/in/sabrina-burka"}
+    ]
+
+
+def test_extract_js_targets_modern_cards_and_relative_links() -> None:
+    from browser_harness.domains.linkedin import EXTRACT_JS
+
+    assert "notification-card-container" in EXTRACT_JS
+    assert "a[href^=\"http\"]" not in EXTRACT_JS
+    assert 'div[class*="notification"]' not in EXTRACT_JS
+
+
 def test_enrich_profile_missing_args() -> None:
     result = enrich_profile()
     assert result["status"] == "error"
