@@ -100,6 +100,8 @@ PROFILE_EXTRACT_JS = """(() => {
     textOf('span.text-body-small.inline.t-black--light') ||
     '';
   let experience = '';
+  let experienceLines = [];
+  let companyLinks = [];
   const expSection = [...document.querySelectorAll('section')]
     .find(el => /\\bexperience\\b/i.test(
       (el.querySelector('h2') || {}).innerText || ''
@@ -109,13 +111,23 @@ PROFILE_EXTRACT_JS = """(() => {
       .trim()
       .replace(/\\s+/g, ' ')
       .slice(0, 800);
+    experienceLines = (expSection.innerText || '')
+      .split('\\n').map(norm).filter(Boolean).slice(0, 40);
+    companyLinks = [...expSection.querySelectorAll('a[href*="/company/"]')]
+      .map(a => ({url: (a.href || '').split('?')[0], text: norm((a.innerText || '').split('\\n')[0])}))
+      .slice(0, 5);
   }
+  const ldJson = [...document.querySelectorAll('script[type="application/ld+json"]')]
+    .map(s => s.textContent || '').filter(t => t.length < 60000).slice(0, 5);
   return {
     name,
     headline,
     about,
     location,
     experience_snip: experience,
+    experience_lines: experienceLines,
+    company_links: companyLinks,
+    ld_json: ldJson,
     url: window.location.href || '',
   };
 })()"""
@@ -465,6 +477,150 @@ def _pick_search_match(
     return url, "ok", named
 
 
+_PAREN_RE = re.compile(r"\s*[\(\[][^\)\]]*[\)\]]")
+_CREDENTIAL_RE = re.compile(
+    r"^(?:[A-Z]{2,6}|Ph\.?D\.?|M\.?D\.?|Jr\.?|Sr\.?|MBA|PMP|CPA|CFA|P\.?E\.?|Esq\.?|"
+    r"[A-Z][a-z]?[A-Z]{1,4}|I{2,3}|IV)$"
+)
+_DURATION_RE = re.compile(
+    r"\b(\d+\s*(yrs?|years?|mos?|months?)|present|full-time|part-time|internship|"
+    r"contract|self-employed|freelance|seasonal|apprenticeship)\b",
+    re.IGNORECASE,
+)
+_HEADLINE_AT_RE = re.compile(r"^(?P<title>.+?)\s+(?:at|@)\s+(?P<company>[^|,·]+)", re.IGNORECASE)
+
+
+def clean_name(raw: str) -> str:
+    """Display name without pronouns, emoji, or trailing credentials.
+
+    "Ada Lovelace (she/her) 🚀, PhD" -> "Ada Lovelace".
+    """
+    text = unicodedata.normalize("NFKC", raw or "")
+    text = _PAREN_RE.sub("", text)
+    text = "".join(
+        c for c in text
+        if unicodedata.category(c) not in ("So", "Sk", "Cs", "Co", "Cn") and c not in "\u200d\ufe0f"
+    )
+    head, *rest = [p.strip() for p in text.split(",")]
+    if rest and all(all(_CREDENTIAL_RE.match(t) for t in p.split()) for p in rest if p):
+        text = head
+    elif rest:
+        text = ", ".join([head, *rest])
+    tokens = text.split()
+    while len(tokens) > 2 and _CREDENTIAL_RE.match(tokens[-1]):
+        tokens.pop()
+    return " ".join(tokens).strip(" -|·")
+
+
+def _ld_nodes(blob: Any) -> list[dict[str, Any]]:
+    if isinstance(blob, list):
+        return [n for item in blob for n in _ld_nodes(item)]
+    if not isinstance(blob, dict):
+        return []
+    nodes = [blob]
+    graph = blob.get("@graph")
+    if graph is not None:
+        nodes.extend(_ld_nodes(graph))
+    return nodes
+
+
+def parse_ld_person(blobs: list[str]) -> dict[str, Any]:
+    """``jobTitle`` / ``worksFor`` from JSON-LD ``Person`` nodes, when LinkedIn ships them."""
+    import json
+
+    for raw in blobs or []:
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        for node in _ld_nodes(data):
+            kind = node.get("@type")
+            kinds = kind if isinstance(kind, list) else [kind]
+            if "Person" not in kinds:
+                continue
+            title = node.get("jobTitle")
+            if isinstance(title, list):
+                title = title[0] if title else ""
+            works = node.get("worksFor")
+            if isinstance(works, list):
+                works = works[0] if works else {}
+            company = works.get("name") if isinstance(works, dict) else (works if isinstance(works, str) else "")
+            company_url = works.get("url") if isinstance(works, dict) else ""
+            if title or company:
+                return {
+                    "title": str(title or "").strip(),
+                    "company": str(company or "").strip(),
+                    "company_url": str(company_url or "").strip(),
+                }
+    return {}
+
+
+_DATE_RE = re.compile(
+    r"^((jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+)?\d{4}\b", re.IGNORECASE
+)
+
+
+def _is_meta(line: str) -> bool:
+    """Employment type, duration, or date line — not a title or a company."""
+    return bool(_DURATION_RE.search(line) or _DATE_RE.match(line))
+
+
+def _dedupe_consecutive(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    for line in lines:
+        if not out or out[-1] != line:
+            out.append(line)
+    return out
+
+
+def parse_experience(lines: list[str], company_links: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Top Experience entry as ``{title, company, company_url}``.
+
+    Handles both layouts: ``Title / Company · Full-time / dates`` and the grouped
+    ``Company / Full-time · 3 yrs / Title / dates``. Text only — no class names.
+    """
+    items = _dedupe_consecutive([line for line in (lines or []) if line])
+    if items and re.fullmatch(r"experience", items[0], re.IGNORECASE):
+        items = items[1:]
+    if len(items) < 2:
+        return {}
+    first, second = items[0], items[1]
+    head = second.split("·")[0].strip()
+    if _is_meta(head):
+        # Grouped: company, then "Full-time · 3 yrs", then the newest role title.
+        company = first
+        title = next((x for x in items[2:6] if not _is_meta(x.split("·")[0].strip())), "")
+    else:
+        title, company = first, head
+    link = next((c for c in company_links or [] if c.get("url")), None)
+    if not company and link:
+        company = str(link.get("text") or "")
+    if not title or _is_meta(title):
+        return {}
+    return {
+        "title": title,
+        "company": company,
+        "company_url": str((link or {}).get("url") or ""),
+    }
+
+
+def current_position(raw: dict[str, Any], headline: str = "") -> dict[str, Any]:
+    """Best current role: JSON-LD, then the Experience section, then ``Title at Company`` headline."""
+    ld = parse_ld_person(raw.get("ld_json") or [])
+    exp = parse_experience(raw.get("experience_lines") or [], raw.get("company_links") or [])
+    pos: dict[str, Any] = {}
+    for source in (ld, exp):
+        for key in ("title", "company", "company_url"):
+            if source.get(key) and not pos.get(key):
+                pos[key] = source[key]
+    if not pos.get("title") or not pos.get("company"):
+        m = _HEADLINE_AT_RE.match(headline or "")
+        if m:
+            pos.setdefault("title", m.group("title").strip())
+            pos.setdefault("company", m.group("company").strip())
+    return {k: v for k, v in pos.items() if v}
+
+
 def enrich_profile(
     name: str | None = None,
     url: str | None = None,
@@ -617,16 +773,23 @@ def enrich_profile(
             about,
             f"Experience: {experience}" if experience else "",
         ]
+        position = current_position(raw, headline)
+        if position:
+            role = " at ".join(p for p in (position.get("title"), position.get("company")) if p)
+            lines.insert(2, f"Current: {role}")
         markdown = "\n\n".join(line for line in lines if line)
         result: dict[str, Any] = {
             "status": "ok",
             "url": final_url,
             "name": out_name,
+            "name_clean": clean_name(out_name),
             "headline": headline,
             "about": about,
             "markdown": markdown,
             "stats": {"stopped_reason": "ok"},
         }
+        if position:
+            result["current_position"] = position
         if location:
             result["location"] = location
         if experience:

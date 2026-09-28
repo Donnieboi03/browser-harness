@@ -1,14 +1,20 @@
 """Unit tests for browser_harness.domains.linkedin."""
 from __future__ import annotations
 
+import json
 from contextlib import contextmanager
 from unittest.mock import patch
 
 import pytest
 
 from browser_harness.domains.linkedin import (
+    PROFILE_EXTRACT_JS,
+    clean_name,
+    current_position,
     enrich_profile,
     name_matches,
+    parse_experience,
+    parse_ld_person,
     parse_relative_age_days,
     scrape_notifications,
 )
@@ -107,6 +113,90 @@ def test_enrich_profile_by_url() -> None:
     assert result["about"] == "First programmer"
     assert result["location"] == "London"
     assert "Ada" in result["markdown"]
+
+
+@pytest.mark.parametrize("raw,clean", [
+    ("Ada Lovelace (she/her)", "Ada Lovelace"),
+    ("Grace Hopper 🚀, PhD", "Grace Hopper"),
+    ("Alan Turing, OBE, FRS", "Alan Turing"),
+    ("Linus Torvalds MBA", "Linus Torvalds"),
+    ("José García", "José García"),
+    ("Mary-Jane Watson ✨", "Mary-Jane Watson"),
+    ("Kim Lee, Head of Growth", "Kim Lee, Head of Growth"),
+])
+def test_clean_name(raw: str, clean: str) -> None:
+    assert clean_name(raw) == clean
+
+
+def test_parse_ld_person_reads_graph() -> None:
+    blob = json.dumps({"@graph": [
+        {"@type": "WebPage"},
+        {"@type": "Person", "jobTitle": ["Staff Engineer"],
+         "worksFor": [{"@type": "Organization", "name": "Acme", "url": "https://www.linkedin.com/company/acme"}]},
+    ]})
+    assert parse_ld_person(["not json", blob]) == {
+        "title": "Staff Engineer", "company": "Acme", "company_url": "https://www.linkedin.com/company/acme",
+    }
+
+
+def test_parse_experience_single_role_layout() -> None:
+    lines = ["Experience", "Senior Engineer", "Senior Engineer", "Acme · Full-time",
+             "Jan 2022 - Present · 2 yrs 3 mos", "San Francisco"]
+    links = [{"url": "https://www.linkedin.com/company/acme/", "text": "Acme"}]
+    assert parse_experience(lines, links) == {
+        "title": "Senior Engineer", "company": "Acme", "company_url": "https://www.linkedin.com/company/acme/",
+    }
+
+
+def test_parse_experience_grouped_layout() -> None:
+    lines = ["Experience", "Acme", "Full-time · 3 yrs", "Staff Engineer", "Jan 2024 - Present · 1 yr",
+             "Senior Engineer", "2021 - 2024"]
+    assert parse_experience(lines) == {"title": "Staff Engineer", "company": "Acme", "company_url": ""}
+
+
+def test_parse_experience_without_employment_type() -> None:
+    assert parse_experience(["Engineer", "Acme", "2020 - Present"])["company"] == "Acme"
+    assert parse_experience(["Experience"]) == {}
+
+
+def test_current_position_prefers_ld_then_experience_then_headline() -> None:
+    raw = {"ld_json": [json.dumps({"@type": "Person", "jobTitle": "CTO"})],
+           "experience_lines": ["Founder", "Beta Inc · Full-time"]}
+    assert current_position(raw) == {"title": "CTO", "company": "Beta Inc"}
+    assert current_position({}, "Product Designer at Figma | ex-Google") == {
+        "title": "Product Designer", "company": "Figma",
+    }
+    assert current_position({}, "Builder of things") == {}
+
+
+def test_enrich_profile_returns_position_and_clean_name() -> None:
+    profile = {
+        "name": "Ada Lovelace (she/her)",
+        "headline": "Mathematician",
+        "about": "First programmer",
+        "experience_lines": ["Experience", "Analyst", "Analytical Engine Co · Full-time", "1842 - Present"],
+        "company_links": [{"url": "https://www.linkedin.com/company/aec/", "text": "Analytical Engine Co"}],
+        "url": "https://www.linkedin.com/in/ada",
+    }
+    with patch("browser_harness.domains.linkedin.tab", _fake_tab), patch(
+        "browser_harness.domains.linkedin.wait_for_load"
+    ), patch("browser_harness.domains.linkedin.time.sleep"), patch(
+        "browser_harness.domains.linkedin.js",
+        side_effect=["https://www.linkedin.com/in/ada", profile],
+    ):
+        result = enrich_profile(url="https://www.linkedin.com/in/ada", name="Ada Lovelace")
+
+    assert result["name_clean"] == "Ada Lovelace"
+    assert result["current_position"] == {
+        "title": "Analyst", "company": "Analytical Engine Co",
+        "company_url": "https://www.linkedin.com/company/aec/",
+    }
+    assert "Current: Analyst at Analytical Engine Co" in result["markdown"]
+
+
+def test_profile_extract_js_reads_ld_json_and_experience_lines() -> None:
+    assert "application/ld+json" in PROFILE_EXTRACT_JS
+    assert "experience_lines" in PROFILE_EXTRACT_JS and "/company/" in PROFILE_EXTRACT_JS
 
 
 def test_enrich_profile_404_is_not_found() -> None:
