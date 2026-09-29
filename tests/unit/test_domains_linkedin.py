@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -12,6 +13,7 @@ from browser_harness.domains.linkedin import (
     clean_name,
     current_position,
     enrich_profile,
+    experience_top,
     name_matches,
     parse_experience,
     parse_ld_person,
@@ -123,6 +125,16 @@ def test_enrich_profile_by_url() -> None:
     ("José García", "José García"),
     ("Mary-Jane Watson ✨", "Mary-Jane Watson"),
     ("Kim Lee, Head of Growth", "Kim Lee, Head of Growth"),
+    ('Robert "Bobby" Tables', "Robert Tables"),
+    ("Katherine “Kat” Example", "Katherine Example"),
+    ("Theodore 'Teddy' Sample", "Theodore Sample"),
+    ("Sean O'Brien", "Sean O'Brien"),
+    ("Riley Moss she/her", "Riley Moss"),
+    ("Jordan Vale They / Them, MBA", "Jordan Vale"),
+    ("Casey Park | casey.park@example.com", "Casey Park"),
+    ("Morgan Quill - mquill@example.org", "Morgan Quill"),
+    ("Dana Frost, CPA, CFA (she/her) 📈", "Dana Frost"),
+    ("Hector Lin PhD PMP", "Hector Lin"),
 ])
 def test_clean_name(raw: str, clean: str) -> None:
     assert clean_name(raw) == clean
@@ -443,3 +455,54 @@ def test_enrich_profile_missing_args() -> None:
     result = enrich_profile()
     assert result["status"] == "error"
     assert result["stats"]["stopped_reason"] == "missing_args"
+
+
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "linkedin"
+
+
+@pytest.mark.parametrize(("fixture", "want"), [
+    ("flat.html", {"title": "Staff Data Engineer", "company": "Northwind Labs",
+                   "company_url": "https://www.linkedin.com/company/northwind-labs/"}),
+    ("grouped.html", {"title": "Engineering Manager", "company": "Contoso Health",
+                      "company_url": "https://www.linkedin.com/company/contoso-health/"}),
+    ("no_company_link.html", {"title": "Founder", "company": "Fabrikam Studio"}),
+    ("heldout/hashed_listitems.html", {"title": "Head of Partnerships", "company": "Wide World Importers",
+                                       "company_url": "https://www.linkedin.com/company/wide-world-importers/"}),
+])
+def test_current_position_from_saved_experience_html(fixture: str, want: dict) -> None:
+    html = (FIXTURES / fixture).read_text()
+    assert current_position({"experience_html": html}) == want
+
+
+def test_top_entry_never_borrows_an_older_roles_company_link() -> None:
+    html = (FIXTURES / "no_company_link.html").read_text()
+    lines, links = experience_top(html)
+    assert links == []
+    assert "Adventure Works · Full-time" not in lines
+    section_lines = ["Experience", "Founder", "Fabrikam Studio · Self-employed", "Product Designer"]
+    section_links = [{"url": "https://www.linkedin.com/company/adventure-works/", "text": ""}]
+    raw = {"experience_html": html, "experience_lines": section_lines, "company_links": section_links}
+    assert "company_url" not in current_position(raw)
+
+
+def test_experience_top_dedupes_screen_reader_copies_and_skips_scripts() -> None:
+    lines, _ = experience_top((FIXTURES / "flat.html").read_text())
+    assert lines[:3] == ["Staff Data Engineer", "Northwind Labs · Full-time", "Mar 2023 - Present · 3 yrs 7 mos"]
+    held, _ = experience_top((FIXTURES / "heldout" / "hashed_listitems.html").read_text())
+    assert not any("tracking" in line for line in held)
+    assert experience_top("") == ([], [])
+    assert experience_top("<ul><li>Engineer<li>unclosed") [0][0].startswith("Engineer")
+
+
+def test_company_url_only_from_the_source_that_named_the_company() -> None:
+    ld = json.dumps({"@type": "Person", "jobTitle": "CTO", "worksFor": {"name": "Beta Inc"}})
+    html = (FIXTURES / "flat.html").read_text()
+    pos = current_position({"ld_json": [ld], "experience_html": html})
+    assert pos == {"title": "CTO", "company": "Beta Inc"}
+    same = json.dumps({"@type": "Person", "worksFor": {"name": "Northwind Labs"}})
+    pos = current_position({"ld_json": [same], "experience_html": html})
+    assert pos["company_url"] == "https://www.linkedin.com/company/northwind-labs/"
+
+
+def test_profile_extract_js_ships_experience_html() -> None:
+    assert "experience_html" in PROFILE_EXTRACT_JS and "outerHTML" in PROFILE_EXTRACT_JS

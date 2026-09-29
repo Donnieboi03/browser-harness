@@ -106,6 +106,16 @@ PROFILE_EXTRACT_JS = """(() => {
     .find(el => /\\bexperience\\b/i.test(
       (el.querySelector('h2') || {}).innerText || ''
     ));
+  const expHeading = [...document.querySelectorAll('h2')]
+    .find(el => /^experience$/i.test(norm(el.innerText)));
+  let expBox = expSection;
+  if (!expBox && expHeading) {
+    expBox = expHeading.closest('section');
+    for (let el = expHeading.parentElement; !expBox && el && el !== document.body; el = el.parentElement) {
+      if (el.querySelector('ul, ol, [role="list"]')) expBox = el;
+    }
+  }
+  const experienceHtml = expBox ? (expBox.outerHTML || '').slice(0, 60000) : '';
   if (expSection) {
     experience = (expSection.innerText || '')
       .trim()
@@ -127,6 +137,7 @@ PROFILE_EXTRACT_JS = """(() => {
     experience_snip: experience,
     experience_lines: experienceLines,
     company_links: companyLinks,
+    experience_html: experienceHtml,
     ld_json: ldJson,
     url: window.location.href || '',
   };
@@ -490,13 +501,22 @@ _DURATION_RE = re.compile(
 _HEADLINE_AT_RE = re.compile(r"^(?P<title>.+?)\s+(?:at|@)\s+(?P<company>[^|,·]+)", re.IGNORECASE)
 
 
-def clean_name(raw: str) -> str:
-    """Display name without pronouns, emoji, or trailing credentials.
+_EMAIL_RE = re.compile(r"\S+@\S+\.\w+")
+_NICK_RE = re.compile(r"\s*(?:[\"“”„«»][^\"“”„«»]*[\"“”„«»]|(?<!\w)['‘’][^'‘’]+['‘’](?!\w))")
+_PRONOUN = r"(?:she|he|they|ze|xe|her|him|them|his|hers|theirs|zir|xem)"
+_PRONOUNS_RE = re.compile(rf"(?<!\S){_PRONOUN}(?:\s*/\s*{_PRONOUN})+(?![\w/])", re.IGNORECASE)
 
-    "Ada Lovelace (she/her) 🚀, PhD" -> "Ada Lovelace".
+
+def clean_name(raw: str) -> str:
+    """Display name without pronouns, nicknames, emails, emoji, or trailing credentials.
+
+    'Ada "Countess" Lovelace (she/her) 🚀, PhD | ada@example.com' -> "Ada Lovelace".
     """
     text = unicodedata.normalize("NFKC", raw or "")
+    text = _EMAIL_RE.sub("", text)
     text = _PAREN_RE.sub("", text)
+    text = _NICK_RE.sub("", text)
+    text = _PRONOUNS_RE.sub("", text)
     text = "".join(
         c for c in text
         if unicodedata.category(c) not in ("So", "Sk", "Cs", "Co", "Cn") and c not in "\u200d\ufe0f"
@@ -509,7 +529,7 @@ def clean_name(raw: str) -> str:
     tokens = text.split()
     while len(tokens) > 2 and _CREDENTIAL_RE.match(tokens[-1]):
         tokens.pop()
-    return " ".join(tokens).strip(" -|·")
+    return " ".join(tokens).strip(" -|·,")
 
 
 def _ld_nodes(blob: Any) -> list[dict[str, Any]]:
@@ -604,15 +624,153 @@ def parse_experience(lines: list[str], company_links: list[dict[str, Any]] | Non
     }
 
 
+_BLOCK_TAGS = frozenset({
+    "address", "article", "aside", "br", "dd", "div", "dl", "dt", "footer", "h1", "h2", "h3",
+    "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p", "section", "table", "td",
+    "th", "tr", "ul",
+})
+_VOID_TAGS = frozenset({"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "wbr"})
+_SKIP_TAGS = frozenset({"script", "style", "svg", "template", "noscript"})
+_ORIGIN = "https://www.linkedin.com"
+_COMPANY_RE = re.compile(r"/company/([^/?#\s]+)")
+
+
+def _is_list(tag: str, attrs: dict[str, str]) -> bool:
+    return tag in ("ul", "ol") or attrs.get("role") == "list"
+
+
+def _is_item(tag: str, attrs: dict[str, str]) -> bool:
+    return tag == "li" or attrs.get("role") == "listitem"
+
+
+def _undouble(line: str) -> str:
+    """'Acme Acme' -> 'Acme' (visible text next to its screen-reader copy)."""
+    words = line.split()
+    half = len(words) // 2
+    if half and len(words) % 2 == 0 and words[:half] == words[half:]:
+        return " ".join(words[:half])
+    return line
+
+
+def experience_top(html: str) -> tuple[list[str], list[dict[str, str]]]:
+    """Text lines and ``/company/`` links of the first entry in an Experience section's HTML.
+
+    Scoped to that one list item, so a company link from an older role is never
+    borrowed when the newest role has none. Structure only (lists, items, links,
+    ``aria-hidden`` text runs), no class names. Company URLs are cut to
+    ``/company/<slug>/``.
+    """
+    from html.parser import HTMLParser
+
+    class _Top(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=True)
+            self.depth = 0
+            self.list_depth: int | None = None
+            self.item_depth: int | None = None
+            self.done = False
+            self.skip = 0
+            self.buf: list[str] = []
+            self.lines: list[str] = []
+            self.links: list[dict[str, str]] = []
+            self.link: dict[str, Any] | None = None
+            self.hidden_ends: list[int] = []
+
+        def _flush(self) -> None:
+            line = _undouble(" ".join(" ".join(self.buf).split()))
+            self.buf = []
+            if line and (not self.lines or self.lines[-1] != line):
+                self.lines.append(line)
+
+        def handle_starttag(self, tag: str, attr_list: list[tuple[str, str | None]]) -> None:
+            attrs = {k: v or "" for k, v in attr_list}
+            if tag not in _VOID_TAGS:
+                self.depth += 1
+            if self.done:
+                return
+            if tag in _SKIP_TAGS:
+                self.skip += 1
+                return
+            if self.item_depth is None:
+                if self.list_depth is None and _is_list(tag, attrs):
+                    self.list_depth = self.depth
+                elif self.list_depth is not None and _is_item(tag, attrs) and tag not in _VOID_TAGS:
+                    self.item_depth = self.depth
+                return
+            if tag in _BLOCK_TAGS or attrs.get("aria-hidden") == "true":
+                self._flush()
+                if tag not in _VOID_TAGS and attrs.get("aria-hidden") == "true":
+                    self.hidden_ends.append(self.depth)
+            slug = _COMPANY_RE.search(attrs.get("href", "")) if tag == "a" else None
+            if slug:
+                self.link = {"url": f"{_ORIGIN}/company/{slug.group(1)}/", "parts": []}
+
+        def handle_endtag(self, tag: str) -> None:
+            depth = self.depth
+            if tag not in _VOID_TAGS:
+                self.depth = max(0, self.depth - 1)
+            if self.done:
+                return
+            if tag in _SKIP_TAGS:
+                self.skip = max(0, self.skip - 1)
+                return
+            if self.item_depth is None:
+                return
+            if tag == "a" and self.link is not None:
+                text = _undouble(" ".join(" ".join(self.link["parts"]).split()))
+                self.links.append({"url": self.link["url"], "text": text})
+                self.link = None
+            if tag in _BLOCK_TAGS or (self.hidden_ends and depth == self.hidden_ends[-1]):
+                self._flush()
+                if self.hidden_ends and depth == self.hidden_ends[-1]:
+                    self.hidden_ends.pop()
+            if depth == self.item_depth:
+                self._flush()
+                self.done = True
+
+        def handle_data(self, data: str) -> None:
+            if self.done or self.skip or self.item_depth is None:
+                return
+            self.buf.append(data)
+            if self.link is not None:
+                self.link["parts"].append(data)
+
+    parser = _Top()
+    try:
+        parser.feed(html or "")
+        parser.close()
+    except Exception:  # noqa: BLE001 — malformed markup: keep what was read
+        pass
+    parser._flush()
+    return parser.lines[:40], parser.links[:5]
+
+
+def _same_company(a: str, b: str) -> bool:
+    return bool(a and b) and " ".join(_tokens(a)) == " ".join(_tokens(b))
+
+
 def current_position(raw: dict[str, Any], headline: str = "") -> dict[str, Any]:
-    """Best current role: JSON-LD, then the Experience section, then ``Title at Company`` headline."""
+    """Best current role: JSON-LD, then the top Experience entry, then ``Title at Company`` headline.
+
+    A company URL is kept only from the source that named that company.
+    """
     ld = parse_ld_person(raw.get("ld_json") or [])
-    exp = parse_experience(raw.get("experience_lines") or [], raw.get("company_links") or [])
+    top_lines, top_links = experience_top(str(raw.get("experience_html") or ""))
+    if top_lines:
+        exp = parse_experience(top_lines, top_links)
+    else:
+        exp = parse_experience(raw.get("experience_lines") or [], raw.get("company_links") or [])
     pos: dict[str, Any] = {}
     for source in (ld, exp):
-        for key in ("title", "company", "company_url"):
-            if source.get(key) and not pos.get(key):
-                pos[key] = source[key]
+        if source.get("title") and not pos.get("title"):
+            pos["title"] = source["title"]
+        if source.get("company") and not pos.get("company"):
+            pos["company"] = source["company"]
+            pos["company_url"] = source.get("company_url") or ""
+        elif not pos.get("company_url") and source.get("company_url") and _same_company(
+            pos.get("company", ""), source.get("company", "")
+        ):
+            pos["company_url"] = source["company_url"]
     if not pos.get("title") or not pos.get("company"):
         m = _HEADLINE_AT_RE.match(headline or "")
         if m:
